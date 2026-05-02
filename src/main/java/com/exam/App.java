@@ -6,7 +6,7 @@ import com.exam.service.ContactService;
 public class App {
     public static void main(String[] args) {
         ContactService service = new ContactService();
-        service.addContact(new Contact("Alice", "123-456-7890"));
+        service.addContact(new Contact("Charlie", "123-456-7890"));
         service.addContact(new Contact("Bob", "987-654-3210"));
 
         System.out.println("--- Contact Manager ---");
