@@ -17,16 +17,109 @@ REMOTE_IMAGE="docker.io/${DOCKERHUB_USER}/devops-lab:latest"
 CONTAINER_NAME="devops-lab"
 VOLUME_NAME="devops-jenkins-home"
 
-# Detect container engine: prioritize podman, fallback to docker
-if command -v podman &>/dev/null; then
-    CONTAINER_ENGINE="podman"
-elif command -v docker &>/dev/null; then
-    CONTAINER_ENGINE="docker"
-else
-    echo "Error: Neither podman nor docker was found on this system." >&2
-    echo "Please install one of them to proceed." >&2
+# Determine if the script is being sourced
+(return 0 2>/dev/null) && sourced=1 || sourced=0
+
+install_container_engine() {
+    echo "Neither podman nor docker was found on this system."
+    
+    # Check if we have sudo or are root
+    local has_sudo=0
+    if [ "$EUID" -eq 0 ]; then
+        has_sudo=1
+    elif command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+        has_sudo=1
+    elif command -v sudo &>/dev/null; then
+        has_sudo=2
+    fi
+
+    if [ "$has_sudo" -eq 0 ]; then
+        echo "Error: Root or sudo privileges are required to install podman." >&2
+        echo "Please ask your lab administrator to install 'podman' or 'docker'." >&2
+        return 1
+    fi
+
+    echo "Would you like to automatically install Podman? (y/n)"
+    local answer
+    if [ "$sourced" -eq 1 ]; then
+        read -p "Install Podman? [y/N]: " answer < /dev/tty
+    else
+        read -p "Install Podman? [y/N]: " answer
+    fi
+
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        echo "Attempting to install Podman..."
+        if command -v apt-get &>/dev/null; then
+            echo "Running: sudo apt-get update && sudo apt-get install -y podman"
+            sudo apt-get update && sudo apt-get install -y podman
+        elif command -v dnf &>/dev/null; then
+            echo "Running: sudo dnf install -y podman"
+            sudo dnf install -y podman
+        elif command -v yum &>/dev/null; then
+            echo "Running: sudo yum install -y podman"
+            sudo yum install -y podman
+        elif command -v pacman &>/dev/null; then
+            echo "Running: sudo pacman -S --noconfirm podman"
+            sudo pacman -S --noconfirm podman
+        else
+            echo "Error: Unsupported package manager. Please install Podman manually." >&2
+            return 1
+        fi
+
+        # Re-verify installation
+        if command -v podman &>/dev/null; then
+            echo "Podman installed successfully!"
+            CONTAINER_ENGINE="podman"
+            return 0
+        else
+            echo "Error: Podman installation finished but 'podman' executable is still not found." >&2
+            return 1
+        fi
+    else
+        echo "Installation cancelled. Please install 'podman' or 'docker' manually." >&2
+        return 1
+    fi
+}
+
+detect_engine() {
+    # 1. Try Podman first (preferred, rootless)
+    if command -v podman &>/dev/null; then
+        if podman ps &>/dev/null; then
+            CONTAINER_ENGINE="podman"
+            return 0
+        else
+            echo "Warning: podman is installed but 'podman ps' failed." >&2
+        fi
+    fi
+
+    # 2. Try Docker
+    if command -v docker &>/dev/null; then
+        if docker ps &>/dev/null; then
+            CONTAINER_ENGINE="docker"
+            return 0
+        else
+            echo "Warning: docker is installed but the Docker daemon is not running or you do not have permission." >&2
+            if command -v systemctl &>/dev/null; then
+                echo "--> You may need to start the docker daemon: sudo systemctl start docker" >&2
+                echo "--> Or add your user to the docker group:   sudo usermod -aG docker \$USER (then log out and log back in)" >&2
+            fi
+        fi
+    fi
+
+    # 3. If neither works, try installing Podman
+    if install_container_engine; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Run the detection
+if ! detect_engine; then
+    echo "Error: Container engine is missing or unusable. Cannot proceed." >&2
     (return 1 2>/dev/null) || exit 1
 fi
+
 
 show_help() {
     echo "Usage: $0 [command] [args...]"
@@ -75,8 +168,6 @@ get_container_work_dir() {
     fi
 }
 
-# Determine if the script is being sourced
-(return 0 2>/dev/null) && sourced=1 || sourced=0
 
 # Ensure wrapper binaries exist in bin/
 ensure_wrappers() {
