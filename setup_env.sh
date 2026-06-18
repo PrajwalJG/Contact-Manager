@@ -1,122 +1,293 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# DevOps Lab Environment Setup Script (Ubuntu Optimized)
-# This script ensures Java 21, Maven 3.9+, Gradle 8.12, Jenkins, and Ansible are installed.
-
-set -e
-
-echo "------------------------------------------------"
-echo "   DevOps Lab Environment Setup & Upgrade"
-echo "------------------------------------------------"
-
-# 1. OS Check
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    if [ "$ID" != "ubuntu" ]; then
-        echo "[WARN] This script is optimized for Ubuntu. For $NAME, please install tools manually:"
-        echo "- Java 21: https://adoptium.net/"
-        echo "- Maven 3.9+: https://maven.apache.org/download.cgi"
-        echo "- Gradle 8.12: https://gradle.org/install/"
-        echo "- Jenkins: https://www.jenkins.io/doc/book/installing/"
-        echo "- Ansible: https://docs.ansible.com/ansible/latest/installation_guide/index.html"
-        exit 1
-    fi
+# Resolve workspace root (absolute path to directory of this script)
+# Supports both bash/zsh and sourced/executed scenarios
+if [ -n "$BASH_SOURCE" ]; then
+    WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+elif [ -n "$ZSH_NAME" ]; then
+    WORKSPACE_ROOT="$(cd "$(dirname "${(%):-%x}")" && pwd)"
 else
-    echo "[ERROR] Could not detect OS. Please install requirements manually."
-    exit 1
+    WORKSPACE_ROOT="$(cd "$(dirname "$0")" && pwd)"
 fi
 
-echo "[INFO] Ubuntu detected. Proceeding with checks..."
+# Constants
+DOCKERHUB_USER="${DOCKERHUB_USER:-pjgooli}"
+IMAGE_NAME="devops-lab:latest"
+REMOTE_IMAGE="docker.io/${DOCKERHUB_USER}/devops-lab:latest"
+CONTAINER_NAME="devops-lab"
+VOLUME_NAME="devops-jenkins-home"
 
-# 2. Update package lists
-sudo apt-get update -y
+# Detect container engine: prioritize podman, fallback to docker
+if command -v podman &>/dev/null; then
+    CONTAINER_ENGINE="podman"
+elif command -v docker &>/dev/null; then
+    CONTAINER_ENGINE="docker"
+else
+    echo "Error: Neither podman nor docker was found on this system." >&2
+    echo "Please install one of them to proceed." >&2
+    (return 1 2>/dev/null) || exit 1
+fi
 
-# 3. Java 21 Check/Install
-if command -v java >/dev/null 2>&1; then
-    JAVA_VER=$(java -version 2>&1 | head -n 1 | cut -d '"' -f 2 | cut -d '.' -f 1)
-    if [ "$JAVA_VER" -lt 21 ]; then
-        echo "[INFO] Upgrading Java to version 21..."
-        sudo apt-get install -y openjdk-21-jdk
+show_help() {
+    echo "Usage: $0 [command] [args...]"
+    echo ""
+    echo "Commands:"
+    echo "  build         Build the DevOps lab container image"
+    echo "  push [user]   Push the image to Docker Hub (default user: $DOCKERHUB_USER)"
+    echo "  start         Start the container in the background (Jenkins on port 8080)"
+    echo "  stop          Stop and remove the container (preserves Jenkins data volume)"
+    echo "  status        Show the container status and Jenkins URL"
+    echo "  run [cmd...]  Run a command inside the container in the current directory context"
+    echo "  shell         Open an interactive bash shell in the container"
+    echo "  help          Show this help message"
+}
+
+ensure_running() {
+    if ! $CONTAINER_ENGINE ps --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}$"; then
+        # Check if container exists but is stopped
+        if $CONTAINER_ENGINE ps -a --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}$"; then
+            echo "Container is stopped. Starting it now..."
+            $CONTAINER_ENGINE start "$CONTAINER_NAME" >/dev/null
+            sleep 1
+        else
+            echo "Error: Container '$CONTAINER_NAME' does not exist." >&2
+            echo "Please run '$0 start' first to create and run it." >&2
+            (return 1 2>/dev/null) || exit 1
+        fi
+    fi
+}
+
+get_container_work_dir() {
+    local current_dir
+    current_dir="$(pwd)"
+    if [[ "$current_dir" == "$HOME"* ]]; then
+        echo "$current_dir"
+    elif [[ "$current_dir" == "$WORKSPACE_ROOT"* ]]; then
+        local rel_path="${current_dir#$WORKSPACE_ROOT}"
+        rel_path="${rel_path#/}"
+        if [ -n "$rel_path" ]; then
+            echo "/workspace/$rel_path"
+        else
+            echo "/workspace"
+        fi
     else
-        echo "[OK] Java 21+ already installed."
+        echo "/workspace"
     fi
-else
-    echo "[INFO] Installing Java 21..."
-    sudo apt-get install -y openjdk-21-jdk
-fi
+}
 
-# 4. Maven 3.9+ Check/Install
-INSTALL_MAVEN=false
-if command -v mvn >/dev/null 2>&1; then
-    MVN_VER=$(mvn -version | head -n 1 | cut -d ' ' -f 3)
-    MVN_MAJOR=$(echo $MVN_VER | cut -d '.' -f 1)
-    MVN_MINOR=$(echo $MVN_VER | cut -d '.' -f 2)
-    if [ "$MVN_MAJOR" -lt 3 ] || ([ "$MVN_MAJOR" -eq 3 ] && [ "$MVN_MINOR" -lt 9 ]); then
-        INSTALL_MAVEN=true
+# Determine if the script is being sourced
+(return 0 2>/dev/null) && sourced=1 || sourced=0
+
+# Ensure wrapper binaries exist in bin/
+ensure_wrappers() {
+    local bin_dir="$WORKSPACE_ROOT/bin"
+    mkdir -p "$bin_dir"
+
+    # mvn wrapper
+    if [ ! -f "$bin_dir/mvn" ]; then
+        echo "Creating wrapper $bin_dir/mvn..."
+        cat << 'EOF' > "$bin_dir/mvn"
+#!/usr/bin/env bash
+WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$WORKSPACE_ROOT/setup_env.sh" run mvn "$@"
+EOF
+        chmod +x "$bin_dir/mvn"
+    fi
+
+    # gradle wrapper
+    if [ ! -f "$bin_dir/gradle" ]; then
+        echo "Creating wrapper $bin_dir/gradle..."
+        cat << 'EOF' > "$bin_dir/gradle"
+#!/usr/bin/env bash
+WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$WORKSPACE_ROOT/setup_env.sh" run gradle "$@"
+EOF
+        chmod +x "$bin_dir/gradle"
+    fi
+
+    # ansible wrapper
+    if [ ! -f "$bin_dir/ansible" ]; then
+        echo "Creating wrapper $bin_dir/ansible..."
+        cat << 'EOF' > "$bin_dir/ansible"
+#!/usr/bin/env bash
+WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$WORKSPACE_ROOT/setup_env.sh" run ansible "$@"
+EOF
+        chmod +x "$bin_dir/ansible"
+    fi
+}
+
+execute_cmd() {
+    case "$1" in
+        build)
+            echo "Building container image '$IMAGE_NAME' using $CONTAINER_ENGINE..."
+            $CONTAINER_ENGINE build -t "$IMAGE_NAME" "$WORKSPACE_ROOT"
+            ;;
+        push)
+            shift
+            target_user="${1:-$DOCKERHUB_USER}"
+            target_image="docker.io/${target_user}/devops-lab:latest"
+            echo "Tagging local image '$IMAGE_NAME' as '$target_image'..."
+            if ! $CONTAINER_ENGINE tag "$IMAGE_NAME" "$target_image"; then
+                echo "Error: Tagging failed. Make sure the local image is built first with '$0 build'." >&2
+                (return 1 2>/dev/null) || exit 1
+            fi
+            echo "Pushing image '$target_image' to Docker Hub..."
+            echo "Make sure you are logged in (using '$CONTAINER_ENGINE login') first."
+            if $CONTAINER_ENGINE push "$target_image"; then
+                echo "Successfully pushed '$target_image' to Docker Hub!"
+            else
+                echo "Error: Pushing failed. Check your login status and credentials." >&2
+                (return 1 2>/dev/null) || exit 1
+            fi
+            ;;
+        start)
+            # Default ports
+            host_port="${JENKINS_PORT:-8080}"
+            host_jnlp_port="${JENKINS_JNLP_PORT:-50000}"
+
+            # Determine which image to run. Try local first, then remote, then pull, then fallback to build.
+            running_image="$IMAGE_NAME"
+            if ! $CONTAINER_ENGINE image inspect "$IMAGE_NAME" &>/dev/null; then
+                if $CONTAINER_ENGINE image inspect "$REMOTE_IMAGE" &>/dev/null; then
+                    running_image="$REMOTE_IMAGE"
+                else
+                    echo "Local image '$IMAGE_NAME' not found. Attempting to pull '$REMOTE_IMAGE'..."
+                    if $CONTAINER_ENGINE pull "$REMOTE_IMAGE"; then
+                        running_image="$REMOTE_IMAGE"
+                    else
+                        echo "Could not pull remote image. Building locally..."
+                        execute_cmd build || (return 1 2>/dev/null) || exit 1
+                    fi
+                fi
+            fi
+
+            # Check if volume exists, create if not
+            if ! $CONTAINER_ENGINE volume inspect "$VOLUME_NAME" &>/dev/null; then
+                echo "Creating named volume '$VOLUME_NAME' for persistent Jenkins data..."
+                $CONTAINER_ENGINE volume create "$VOLUME_NAME" >/dev/null
+            fi
+
+            # Check if container is running or exists
+            if $CONTAINER_ENGINE ps -a --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}$"; then
+                if ! $CONTAINER_ENGINE ps --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}$"; then
+                    echo "Starting existing container '$CONTAINER_NAME'..."
+                    $CONTAINER_ENGINE start "$CONTAINER_NAME" >/dev/null
+                else
+                    echo "Container '$CONTAINER_NAME' is already running."
+                fi
+            else
+                # Check if port is in use (by looking for exact port binding in ss output)
+                if command -v ss &>/dev/null && ss -lptn 2>/dev/null | grep -Eq ":${host_port}\s"; then
+                    echo "Error: Port $host_port is already in use on the host system." >&2
+                    echo "You can run Jenkins on a different port by setting the JENKINS_PORT environment variable." >&2
+                    echo "Example: JENKINS_PORT=9090 ./setup_env.sh" >&2
+                    (return 1 2>/dev/null) || exit 1
+                fi
+
+                echo "Starting new container '$CONTAINER_NAME' on port $host_port..."
+                # Run container as root to match permissions in rootless container runtimes
+                $CONTAINER_ENGINE run -d \
+                    --name "$CONTAINER_NAME" \
+                    -p "$host_port":8080 \
+                    -p "$host_jnlp_port":50000 \
+                    -v "$VOLUME_NAME":/var/jenkins_home \
+                    -v "$WORKSPACE_ROOT":/workspace:Z \
+                    -v "$HOME":"$HOME":z \
+                    --workdir /workspace \
+                    "$running_image" >/dev/null
+            fi
+            echo "Jenkins is starting up in the background."
+            active_port=$($CONTAINER_ENGINE port "$CONTAINER_NAME" 8080/tcp 2>/dev/null | sed 's/.*://')
+            [ -z "$active_port" ] && active_port="$host_port"
+            echo "It will be accessible shortly at: http://localhost:$active_port"
+            ;;
+        stop)
+            if $CONTAINER_ENGINE ps -a --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}$"; then
+                echo "Stopping container '$CONTAINER_NAME'..."
+                $CONTAINER_ENGINE stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                echo "Removing container '$CONTAINER_NAME'..."
+                $CONTAINER_ENGINE rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+                echo "Container stopped and removed successfully."
+            else
+                echo "Container '$CONTAINER_NAME' is not running or created."
+            fi
+            ;;
+        status)
+            if $CONTAINER_ENGINE ps --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}$"; then
+                active_port=$($CONTAINER_ENGINE port "$CONTAINER_NAME" 8080/tcp 2>/dev/null | sed 's/.*://')
+                [ -z "$active_port" ] && active_port="8080"
+                echo "Status: RUNNING"
+                echo "Engine: $CONTAINER_ENGINE"
+                echo "Jenkins URL: http://localhost:$active_port"
+            elif $CONTAINER_ENGINE ps -a --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}$"; then
+                echo "Status: STOPPED"
+            else
+                echo "Status: NOT CREATED"
+            fi
+            ;;
+        run)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Error: No command specified to run." >&2
+                (return 1 2>/dev/null) || exit 1
+            fi
+            ensure_running
+            work_dir=$(get_container_work_dir)
+            exec $CONTAINER_ENGINE exec -w "$work_dir" -it "$CONTAINER_NAME" "$@"
+            ;;
+        shell)
+            ensure_running
+            work_dir=$(get_container_work_dir)
+            exec $CONTAINER_ENGINE exec -w "$work_dir" -it "$CONTAINER_NAME" bash
+            ;;
+        help)
+            show_help
+            ;;
+        *)
+            show_help
+            (return 1 2>/dev/null) || exit 1
+            ;;
+    esac
+}
+
+# If arguments are passed, execute the command and exit
+if [ $# -gt 0 ]; then
+    execute_cmd "$@"
+    # Only exit if not sourced, otherwise return
+    if [ "$sourced" -eq 1 ]; then
+        return 0 2>/dev/null
     else
-        echo "[OK] Maven $MVN_VER already installed."
+        exit 0
     fi
-else
-    INSTALL_MAVEN=true
 fi
 
-if [ "$INSTALL_MAVEN" = true ]; then
-    echo "[INFO] Installing/Upgrading Maven to 3.9.9..."
-    wget -q https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz -P /tmp
-    sudo tar -xzf /tmp/apache-maven-3.9.9-bin.tar.gz -C /opt
-    sudo ln -sf /opt/apache-maven-3.9.9/bin/mvn /usr/local/bin/mvn
-    echo "[OK] Maven 3.9.9 installed to /usr/local/bin/mvn"
+# No arguments: standard setup mode
+echo "Initializing DevOps containerized environment..."
+ensure_wrappers
+if ! execute_cmd start; then
+    echo "Error: Failed to initialize the DevOps container environment." >&2
+    (return 1 2>/dev/null) || exit 1
 fi
 
-# 5. Gradle 8.12 Check/Install
-INSTALL_GRADLE=false
-if command -v gradle >/dev/null 2>&1; then
-    GRADLE_VER=$(gradle -v | grep 'Gradle' | cut -d ' ' -f 2)
-    GRADLE_MAJOR=$(echo $GRADLE_VER | cut -d '.' -f 1)
-    if [ "$GRADLE_MAJOR" -lt 8 ]; then
-        INSTALL_GRADLE=true
+if [ "$sourced" -eq 1 ]; then
+    # Add bin/ to PATH if not already present
+    BIN_DIR="$WORKSPACE_ROOT/bin"
+    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+        export PATH="$BIN_DIR:$PATH"
+        echo "--> Added wrapper binaries to PATH: $BIN_DIR"
     fi
+    echo "Environment fully configured. You can now run 'mvn', 'gradle', and 'ansible' commands directly!"
 else
-    INSTALL_GRADLE=true
+    echo ""
+    echo "========================================================================"
+    echo " DevOps container successfully started!"
+    echo " Jenkins is launching in the background."
+    echo ""
+    echo " NOTE: You did not 'source' this script, so your command wrappers"
+    echo " (mvn, gradle, ansible) are NOT loaded in this shell session."
+    echo ""
+    echo " To load them, please run:"
+    echo "     source setup_env.sh"
+    echo "========================================================================"
 fi
-
-if [ "$INSTALL_GRADLE" = true ]; then
-    echo "[INFO] Installing/Upgrading Gradle to 8.12..."
-    wget -q https://services.gradle.org/distributions/gradle-8.12-bin.zip -P /tmp
-    sudo unzip -oq /tmp/gradle-8.12-bin.zip -d /opt
-    sudo ln -sf /opt/gradle-8.12/bin/gradle /usr/local/bin/gradle
-    echo "[OK] Gradle 8.12 installed to /usr/local/bin/gradle"
-fi
-
-# 6. Jenkins Check/Install
-if ! command -v jenkins >/dev/null 2>&1; then
-    echo "[INFO] Installing Jenkins..."
-    sudo wget -O /usr/share/keyrings/jenkins-keyring.asc https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
-    echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" | sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null
-    sudo apt-get update -y
-    sudo apt-get install -y jenkins
-    sudo systemctl enable jenkins
-    sudo systemctl start jenkins
-    echo "[OK] Jenkins installed and started."
-else
-    echo "[OK] Jenkins already installed."
-fi
-
-# 7. Ansible Check/Install
-if ! command -v ansible >/dev/null 2>&1; then
-    echo "[INFO] Installing Ansible..."
-    sudo apt-get install -y ansible
-    echo "[OK] Ansible installed."
-else
-    echo "[OK] Ansible already installed."
-fi
-
-echo "------------------------------------------------"
-echo "   Setup Complete! Current Versions:"
-echo "------------------------------------------------"
-java -version 2>&1 | head -n 1
-mvn -version | head -n 1
-gradle -v | grep 'Gradle'
-ansible --version | head -n 1
-systemctl is-active jenkins
-echo "------------------------------------------------"
